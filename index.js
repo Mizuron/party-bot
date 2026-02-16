@@ -1,5 +1,12 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require("discord.js");
 const cron = require("node-cron");
 
 // ---- Mini Web Server (needed for Render Web Service Free plan: opens a port) ----
@@ -13,7 +20,12 @@ app.listen(process.env.PORT || 3000, () => {
 
 // ---- Discord Client ----
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages, // needed for messageDelete events
+  ],
+  partials: [Partials.Message, Partials.Channel], // helps when deleted message is partial
 });
 
 const GUILD_ID = process.env.GUILD_ID;
@@ -28,6 +40,9 @@ for (let i = 1; i <= 12; i++) {
 }
 const ALL_PARTY_ROLE_IDS = new Set(Object.values(PARTY_ROLE_IDS));
 
+// We'll remember the current selection message id (in memory)
+let selectionMessageId = null;
+
 function getCurrentPartyRole(member) {
   return member.roles.cache.find((r) => ALL_PARTY_ROLE_IDS.has(r.id)) ?? null;
 }
@@ -40,35 +55,60 @@ function buildPartyButtons() {
       .setStyle(ButtonStyle.Primary);
 
   // max 5 buttons per row
-  const row1 = new ActionRowBuilder().addComponents(makeBtn(1), makeBtn(2), makeBtn(3), makeBtn(4), makeBtn(5));
-  const row2 = new ActionRowBuilder().addComponents(makeBtn(6), makeBtn(7), makeBtn(8), makeBtn(9), makeBtn(10));
+  const row1 = new ActionRowBuilder().addComponents(
+    makeBtn(1),
+    makeBtn(2),
+    makeBtn(3),
+    makeBtn(4),
+    makeBtn(5)
+  );
+  const row2 = new ActionRowBuilder().addComponents(
+    makeBtn(6),
+    makeBtn(7),
+    makeBtn(8),
+    makeBtn(9),
+    makeBtn(10)
+  );
   const row3 = new ActionRowBuilder().addComponents(makeBtn(11), makeBtn(12));
 
   return [row1, row2, row3];
 }
 
-async function ensureSelectionMessage(guild) {
-  const channel = await guild.channels.fetch(SELECTION_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) throw new Error("Selection channel not found or not text-based.");
-
+function selectionContent() {
   // Bigger title using Markdown heading
-  const content =
+  return (
     `# Select your Party for Today\n\n` +
     `**Rules:**\n` +
     `• You can only be in **one Party at a time**.\n` +
     `• If you already have a Party role and chose the wrong one, you need to ask a **Leader** to remove it.\n\n` +
-    `**All Party roles reset automatically at midnight (00:00).**`;
+    `**All Party roles reset automatically at midnight (00:00).**`
+  );
+}
 
+async function ensureSelectionMessage(guild) {
+  const channel = await guild.channels.fetch(SELECTION_CHANNEL_ID);
+  if (!channel || !channel.isTextBased())
+    throw new Error("Selection channel not found or not text-based.");
+
+  const content = selectionContent();
   const components = buildPartyButtons();
 
-  // Edit existing bot message if found, otherwise create a new one
+  // Try to find an existing bot message (avoid duplicates)
   const messages = await channel.messages.fetch({ limit: 25 });
-  const existing = messages.find((m) => m.author.id === client.user.id && m.content.includes("Select your Party for Today"));
+  const existing = messages.find(
+    (m) =>
+      m.author?.id === client.user.id &&
+      m.content?.includes("Select your Party for Today")
+  );
 
   if (existing) {
     await existing.edit({ content, components });
+    selectionMessageId = existing.id;
+    return existing;
   } else {
-    await channel.send({ content, components });
+    const msg = await channel.send({ content, components });
+    selectionMessageId = msg.id;
+    return msg;
   }
 }
 
@@ -76,9 +116,14 @@ async function resetAllPartyRoles(guild) {
   const members = await guild.members.fetch();
 
   for (const [, member] of members) {
-    const rolesToRemove = member.roles.cache.filter((r) => ALL_PARTY_ROLE_IDS.has(r.id));
+    const rolesToRemove = member.roles.cache.filter((r) =>
+      ALL_PARTY_ROLE_IDS.has(r.id)
+    );
     if (rolesToRemove.size > 0) {
-      await member.roles.remove(rolesToRemove.map((r) => r.id), "Daily midnight party reset");
+      await member.roles.remove(
+        rolesToRemove.map((r) => r.id),
+        "Daily midnight party reset"
+      );
     }
   }
 }
@@ -103,6 +148,57 @@ client.once("ready", async () => {
   console.log("Midnight reset scheduler started (Europe/Berlin).");
 });
 
+// ---- AUTO REPOST if the selection message gets deleted ----
+client.on("messageDelete", async (message) => {
+  try {
+    // We only care about the selection channel
+    if (message.channelId !== SELECTION_CHANNEL_ID) return;
+
+    // If we know the message id and it matches -> repost
+    if (selectionMessageId && message.id === selectionMessageId) {
+      console.log("Selection message deleted. Reposting...");
+      const guild = await client.guilds.fetch(GUILD_ID);
+      await ensureSelectionMessage(guild);
+      return;
+    }
+
+    // Fallback: if author info exists and it's our bot -> repost
+    if (message.author?.id === client.user.id) {
+      console.log("A bot message was deleted in selection channel. Reposting...");
+      const guild = await client.guilds.fetch(GUILD_ID);
+      await ensureSelectionMessage(guild);
+    }
+  } catch (e) {
+    console.error("Auto-repost failed:", e);
+  }
+});
+
+// Handles "Delete many messages" actions
+client.on("messageDeleteBulk", async (messages) => {
+  try {
+    const anyInSelectionChannel = [...messages.values()].some(
+      (m) => m.channelId === SELECTION_CHANNEL_ID
+    );
+    if (!anyInSelectionChannel) return;
+
+    const deletedOurSelection = selectionMessageId
+      ? [...messages.values()].some((m) => m.id === selectionMessageId)
+      : false;
+
+    const deletedAnyBotMsg = [...messages.values()].some(
+      (m) => m.channelId === SELECTION_CHANNEL_ID && m.author?.id === client.user.id
+    );
+
+    if (deletedOurSelection || deletedAnyBotMsg) {
+      console.log("Selection message (or bot message) deleted in bulk. Reposting...");
+      const guild = await client.guilds.fetch(GUILD_ID);
+      await ensureSelectionMessage(guild);
+    }
+  } catch (e) {
+    console.error("Auto-repost bulk failed:", e);
+  }
+});
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
   if (!interaction.customId.startsWith("party_")) return;
@@ -110,7 +206,6 @@ client.on("interactionCreate", async (interaction) => {
   const member = await interaction.guild.members.fetch(interaction.user.id);
   const current = getCurrentPartyRole(member);
 
-  // If already in a party: tell them exactly which one + leader note
   if (current) {
     return interaction.reply({
       content:
