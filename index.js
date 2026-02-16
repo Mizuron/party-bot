@@ -15,19 +15,19 @@ const express = require("express");
 const web = express();
 web.get("/", (req, res) => res.send("Karma Party Bot is running."));
 
-const PORT = Number(process.env.PORT);
-if (!PORT) console.log("Render PORT variable missing!");
-else web.listen(PORT, "0.0.0.0", () => console.log(`Web server running on 0.0.0.0:${PORT}`));
+const PORT = Number(process.env.PORT) || 3000;
+web.listen(PORT, "0.0.0.0", () => console.log(`Web server running on 0.0.0.0:${PORT}`));
 
 // ================= CONFIG =================
 const PARTY_LIMIT = 6;
 const TIMEZONE = "Europe/Berlin";
+const REFRESH_INTERVAL_MS = 60_000; // 60s backup refresh (safe, low rate)
 
 // ================= DISCORD CLIENT =================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMembers,   // Server Members Intent ON in Dev Portal
     GatewayIntentBits.GuildMessages,
   ],
   partials: [Partials.Message, Partials.Channel],
@@ -36,22 +36,26 @@ const client = new Client({
 const GUILD_ID = process.env.GUILD_ID;
 const SELECTION_CHANNEL_ID = process.env.SELECTION_CHANNEL_ID;
 
+if (!GUILD_ID) throw new Error("Missing env var GUILD_ID");
+if (!SELECTION_CHANNEL_ID) throw new Error("Missing env var SELECTION_CHANNEL_ID");
+
 // Party roles from env vars: PARTY_ROLE_1 ... PARTY_ROLE_12
 const PARTY_ROLE_IDS = {};
 for (let i = 1; i <= 12; i++) {
   const value = process.env[`PARTY_ROLE_${i}`];
-  if (!value) throw new Error(`Missing PARTY_ROLE_${i}`);
+  if (!value) throw new Error(`Missing env var PARTY_ROLE_${i}`);
   PARTY_ROLE_IDS[i] = value;
 }
 const ALL_PARTY_ROLE_IDS = new Set(Object.values(PARTY_ROLE_IDS));
 
-// Remember the selection message id (best effort)
+// remember the selection message id (best effort)
 let selectionMessageId = null;
 
-// Prevent overlapping edits (rate-limit safe)
+// update lock + queue (so we never lose an update)
 let updating = false;
+let pendingUpdate = false;
 
-// ================= UI BUILDERS =================
+// ================= UI =================
 function buildPartyButtons() {
   const makeBtn = (i) =>
     new ButtonBuilder()
@@ -66,7 +70,6 @@ function buildPartyButtons() {
     makeBtn(6), makeBtn(7), makeBtn(8), makeBtn(9), makeBtn(10)
   );
   const row3 = new ActionRowBuilder().addComponents(makeBtn(11), makeBtn(12));
-
   return [row1, row2, row3];
 }
 
@@ -85,11 +88,8 @@ function getCurrentPartyRole(member) {
   return member.roles.cache.find((r) => ALL_PARTY_ROLE_IDS.has(r.id)) ?? null;
 }
 
-// ================= STATUS EMBED (CLEAN + NO DUPLICATES) =================
+// ================= STATUS EMBED (NO FORCE FETCH -> NO OPCODE 8 RATE LIMIT) =================
 async function buildStatusEmbed(guild) {
-  // force a fresh member cache -> accurate role.members
-  await guild.members.fetch({ force: true });
-
   const embed = new EmbedBuilder()
     .setTitle("Party Status")
     .setDescription(`Max **${PARTY_LIMIT}** players per Party.`)
@@ -98,6 +98,7 @@ async function buildStatusEmbed(guild) {
   const lines1 = [];
   const lines2 = [];
 
+  // role.members updates via gateway events; no heavy fetch needed
   for (let i = 1; i <= 12; i++) {
     const roleId = PARTY_ROLE_IDS[i];
     const role = await guild.roles.fetch(roleId);
@@ -105,7 +106,6 @@ async function buildStatusEmbed(guild) {
     const members = role?.members ? [...role.members.values()] : [];
     const count = members.length;
 
-    // Unique names, sorted, show max PARTY_LIMIT names
     const uniqueNames = [...new Set(members.map((m) => m.displayName))]
       .sort((a, b) => a.localeCompare(b));
 
@@ -127,32 +127,46 @@ async function buildStatusEmbed(guild) {
   return embed;
 }
 
-// ================= MESSAGE MANAGEMENT =================
+// ================= MESSAGE FIND/CREATE =================
 async function findOrCreateSelectionMessage(guild) {
   const channel = await guild.channels.fetch(SELECTION_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) throw new Error("Selection channel not found.");
+  if (!channel || !channel.isTextBased()) throw new Error("Selection channel not found or not text-based.");
 
+  // try by remembered id first
+  if (selectionMessageId) {
+    try {
+      const msg = await channel.messages.fetch(selectionMessageId);
+      if (msg) return msg;
+    } catch {
+      selectionMessageId = null;
+    }
+  }
+
+  // try to find existing bot message
   const messages = await channel.messages.fetch({ limit: 25 });
   const existing = messages.find(
     (m) => m.author?.id === client.user.id && m.content?.includes("Select your Party for Today")
   );
-
   if (existing) {
     selectionMessageId = existing.id;
     return existing;
   }
 
+  // create new
   const msg = await channel.send({
     content: selectionContent(),
     components: buildPartyButtons(),
   });
-
   selectionMessageId = msg.id;
   return msg;
 }
 
+// ================= UPDATE SELECTION MESSAGE =================
 async function updateSelectionMessage(guild) {
-  if (updating) return;
+  if (updating) {
+    pendingUpdate = true;
+    return;
+  }
   updating = true;
 
   try {
@@ -168,12 +182,17 @@ async function updateSelectionMessage(guild) {
     console.error("Update failed:", e);
   } finally {
     updating = false;
+    if (pendingUpdate) {
+      pendingUpdate = false;
+      setTimeout(() => updateSelectionMessage(guild).catch(console.error), 800);
+    }
   }
 }
 
 // ================= RESET =================
 async function resetAllPartyRoles(guild) {
-  const members = await guild.members.fetch({ force: true });
+  // IMPORTANT: this fetch is once per day only -> safe
+  const members = await guild.members.fetch();
 
   for (const [, member] of members) {
     const rolesToRemove = member.roles.cache.filter((r) => ALL_PARTY_ROLE_IDS.has(r.id));
@@ -191,13 +210,19 @@ client.once("ready", async () => {
 
   const guild = await client.guilds.fetch(GUILD_ID);
 
-  // Initial post/update
+  // one initial fetch to warm cache (NOT force, not repeated)
+  try {
+    await guild.members.fetch();
+  } catch (e) {
+    console.log("Initial members fetch failed (can be ignored in most cases):", e?.message || e);
+  }
+
   await updateSelectionMessage(guild);
 
-  // Backup refresh every 30 seconds (always correct even if events fail)
-  setInterval(() => updateSelectionMessage(guild).catch(console.error), 30_000);
+  // backup refresh every 60s (no heavy fetch, safe)
+  setInterval(() => updateSelectionMessage(guild).catch(console.error), REFRESH_INTERVAL_MS);
 
-  // Midnight reset
+  // midnight reset
   cron.schedule(
     "0 0 * * *",
     async () => {
@@ -208,7 +233,7 @@ client.once("ready", async () => {
     { timezone: TIMEZONE }
   );
 
-  console.log(`Midnight reset scheduler started (${TIMEZONE}).`);
+  console.log(`Scheduler started: reset at 00:00 (${TIMEZONE})`);
 });
 
 // Auto repost if deleted
@@ -218,6 +243,7 @@ client.on("messageDelete", async (message) => {
 
     if ((selectionMessageId && message.id === selectionMessageId) || message.author?.id === client.user.id) {
       const guild = await client.guilds.fetch(GUILD_ID);
+      selectionMessageId = null; // force re-find/create if needed
       await updateSelectionMessage(guild);
       console.log("Selection message deleted → reposted/updated.");
     }
@@ -236,6 +262,7 @@ client.on("messageDeleteBulk", async (messages) => {
     if (!affected) return;
 
     const guild = await client.guilds.fetch(GUILD_ID);
+    selectionMessageId = null;
     await updateSelectionMessage(guild);
     console.log("Bulk delete detected → reposted/updated.");
   } catch (e) {
@@ -243,51 +270,58 @@ client.on("messageDeleteBulk", async (messages) => {
   }
 });
 
-// ================= BUTTON HANDLER (LIVE UPDATE) =================
+// ================= BUTTON HANDLER (NO "INTERACTION FAILED") =================
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isButton()) return;
-  if (!interaction.customId.startsWith("party_")) return;
+  try {
+    if (!interaction.isButton()) return;
+    if (!interaction.customId.startsWith("party_")) return;
 
-  const guild = interaction.guild;
-  const member = await guild.members.fetch(interaction.user.id);
+    // prevents "Diese Interaktion ist fehlgeschlagen"
+    await interaction.deferReply({ ephemeral: true });
 
-  const current = getCurrentPartyRole(member);
-  if (current) {
-    return interaction.reply({
+    const guild = interaction.guild;
+    const member = await guild.members.fetch(interaction.user.id);
+
+    const current = getCurrentPartyRole(member);
+    if (current) {
+      return interaction.editReply({
+        content:
+          `❌ You are already in **${current.name}**.\n` +
+          `If you chose the wrong Party, please ask a **Leader** to remove your current Party role.`,
+      });
+    }
+
+    const partyNumber = Number(interaction.customId.split("_")[1]);
+    const roleId = PARTY_ROLE_IDS[partyNumber];
+
+    const role = await guild.roles.fetch(roleId);
+    const currentCount = role?.members ? role.members.size : 0;
+
+    if (currentCount >= PARTY_LIMIT) {
+      return interaction.editReply({
+        content: `⛔ **Party ${partyNumber} is full (${PARTY_LIMIT}/${PARTY_LIMIT}).** Please choose another Party.`,
+      });
+    }
+
+    await member.roles.add(roleId, "Party selected via button");
+
+    await interaction.editReply({
       content:
-        `❌ You are already in **${current.name}**.\n` +
-        `If you chose the wrong Party, please ask a **Leader** to remove your current Party role.`,
-      ephemeral: true,
+        `✅ You joined **Party ${partyNumber}** (**${Math.min(currentCount + 1, PARTY_LIMIT)}/${PARTY_LIMIT}**).\n` +
+        `Your role will reset automatically at **midnight (00:00)**.\n` +
+        `If you chose the wrong Party, ask a **Leader** to remove your role.`,
     });
+
+    // LIVE UPDATE (wait a moment so cache updates)
+    setTimeout(() => updateSelectionMessage(guild).catch(console.error), 1200);
+  } catch (e) {
+    console.error("interactionCreate failed:", e);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply({ content: "❌ Something went wrong. Please try again." });
+      }
+    } catch {}
   }
-
-  const partyNumber = Number(interaction.customId.split("_")[1]);
-  const roleId = PARTY_ROLE_IDS[partyNumber];
-
-  // Accurate count before adding
-  await guild.members.fetch({ force: true });
-  const role = await guild.roles.fetch(roleId);
-  const currentCount = role?.members ? role.members.size : 0;
-
-  if (currentCount >= PARTY_LIMIT) {
-    return interaction.reply({
-      content: `⛔ **Party ${partyNumber} is full (${PARTY_LIMIT}/${PARTY_LIMIT}).** Please choose another Party.`,
-      ephemeral: true,
-    });
-  }
-
-  await member.roles.add(roleId, "Party selected via button");
-
-  await interaction.reply({
-    content:
-      `✅ You joined **Party ${partyNumber}** (**${currentCount + 1}/${PARTY_LIMIT}**).\n` +
-      `Your role will reset automatically at **midnight (00:00)**.\n` +
-      `If you chose the wrong Party, ask a **Leader** to remove your role.`,
-    ephemeral: true,
-  });
-
-  // LIVE UPDATE immediately after join
-  await updateSelectionMessage(guild);
 });
 
 // ================= ERROR HANDLING (NO CRASH) =================
