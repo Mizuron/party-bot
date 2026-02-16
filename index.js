@@ -49,7 +49,7 @@ for (let i = 1; i <= 12; i++) {
 const ALL_PARTY_ROLE_IDS = new Set(Object.values(PARTY_ROLE_IDS));
 
 // remember the selection message id (best effort)
-let selectionMessageId = null;
+const fs = require("fs"); const MESSAGE_FILE = "./selectionMessage.json";  let selectionMessageId = null;  function loadMessageId() {   try {     const data = JSON.parse(fs.readFileSync(MESSAGE_FILE));     selectionMessageId = data.id;   } catch {     selectionMessageId = null;   } }  function saveMessageId(id) {   fs.writeFileSync(MESSAGE_FILE, JSON.stringify({ id }));   selectionMessageId = id; }
 
 // update lock + queue (so we never lose an update)
 let updating = false;
@@ -157,7 +157,7 @@ async function findOrCreateSelectionMessage(guild) {
     content: selectionContent(),
     components: buildPartyButtons(),
   });
-  selectionMessageId = msg.id;
+  saveMessageId(msg.id);
   return msg;
 }
 
@@ -207,6 +207,8 @@ async function resetAllPartyRoles(guild) {
 // ================= EVENTS =================
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  loadMessageId(); // <-- HIER EINFÜGEN
 
   const guild = await client.guilds.fetch(GUILD_ID);
 
