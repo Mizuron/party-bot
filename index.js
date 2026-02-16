@@ -13,19 +13,11 @@ const express = require("express");
 
 // ================= MINI WEB SERVER (FOR RENDER WEB SERVICE) =================
 const web = express();
-
-web.get("/", (req, res) => {
-  res.send("Karma Party Bot is running.");
-});
+web.get("/", (req, res) => res.send("Karma Party Bot is running."));
 
 const PORT = Number(process.env.PORT);
-if (!PORT) {
-  console.log("Render PORT variable missing!");
-} else {
-  web.listen(PORT, "0.0.0.0", () => {
-    console.log(`Web server running on 0.0.0.0:${PORT}`);
-  });
-}
+if (!PORT) console.log("Render PORT variable missing!");
+else web.listen(PORT, "0.0.0.0", () => console.log(`Web server running on 0.0.0.0:${PORT}`));
 
 // ================= CONFIG =================
 const PARTY_LIMIT = 6;
@@ -53,14 +45,11 @@ for (let i = 1; i <= 12; i++) {
 }
 const ALL_PARTY_ROLE_IDS = new Set(Object.values(PARTY_ROLE_IDS));
 
+// Remember the selection message id (best effort)
 let selectionMessageId = null;
 
-// debounce updates (avoid too many edits)
-let updateTimer = null;
-function scheduleStatusUpdate(guild) {
-  if (updateTimer) clearTimeout(updateTimer);
-  updateTimer = setTimeout(() => updateSelectionMessage(guild).catch(console.error), 1200);
-}
+// Prevent overlapping edits (rate-limit safe)
+let updating = false;
 
 // ================= UI BUILDERS =================
 function buildPartyButtons() {
@@ -77,6 +66,7 @@ function buildPartyButtons() {
     makeBtn(6), makeBtn(7), makeBtn(8), makeBtn(9), makeBtn(10)
   );
   const row3 = new ActionRowBuilder().addComponents(makeBtn(11), makeBtn(12));
+
   return [row1, row2, row3];
 }
 
@@ -97,15 +87,16 @@ function getCurrentPartyRole(member) {
 
 // ================= STATUS EMBED (CLEAN + NO DUPLICATES) =================
 async function buildStatusEmbed(guild) {
-  await guild.members.fetch();
+  // force a fresh member cache -> accurate role.members
+  await guild.members.fetch({ force: true });
 
   const embed = new EmbedBuilder()
     .setTitle("Party Status")
     .setDescription(`Max **${PARTY_LIMIT}** players per Party.`)
     .setTimestamp(new Date());
 
-  // One clean line per party (no spam fields)
-  let lines = [];
+  const lines1 = [];
+  const lines2 = [];
 
   for (let i = 1; i <= 12; i++) {
     const roleId = PARTY_ROLE_IDS[i];
@@ -114,25 +105,23 @@ async function buildStatusEmbed(guild) {
     const members = role?.members ? [...role.members.values()] : [];
     const count = members.length;
 
-    // Deduplicate names
+    // Unique names, sorted, show max PARTY_LIMIT names
     const uniqueNames = [...new Set(members.map((m) => m.displayName))]
       .sort((a, b) => a.localeCompare(b));
 
-    // Show max 6 names (party limit)
     const shown = uniqueNames.slice(0, PARTY_LIMIT);
     const nameText = shown.length ? shown.join(", ") : "Empty";
 
     const fullTag = count >= PARTY_LIMIT ? " ✅ FULL" : "";
-    lines.push(`**Party ${i} — ${count}/${PARTY_LIMIT}${fullTag}**\n${nameText}`);
+    const line = `**Party ${i} — ${count}/${PARTY_LIMIT}${fullTag}**\n${nameText}`;
+
+    if (i <= 6) lines1.push(line);
+    else lines2.push(line);
   }
 
-  // Split into two blocks so it isn't one giant wall
-  const firstHalf = lines.slice(0, 6).join("\n\n");
-  const secondHalf = lines.slice(6).join("\n\n");
-
   embed.addFields(
-    { name: "Parties 1–6", value: firstHalf || "—", inline: false },
-    { name: "Parties 7–12", value: secondHalf || "—", inline: false }
+    { name: "Parties 1–6", value: lines1.join("\n\n") || "—", inline: false },
+    { name: "Parties 7–12", value: lines2.join("\n\n") || "—", inline: false }
   );
 
   return embed;
@@ -163,19 +152,28 @@ async function findOrCreateSelectionMessage(guild) {
 }
 
 async function updateSelectionMessage(guild) {
-  const msg = await findOrCreateSelectionMessage(guild);
-  const embed = await buildStatusEmbed(guild);
+  if (updating) return;
+  updating = true;
 
-  await msg.edit({
-    content: selectionContent(),
-    components: buildPartyButtons(),
-    embeds: [embed],
-  });
+  try {
+    const msg = await findOrCreateSelectionMessage(guild);
+    const embed = await buildStatusEmbed(guild);
+
+    await msg.edit({
+      content: selectionContent(),
+      components: buildPartyButtons(),
+      embeds: [embed],
+    });
+  } catch (e) {
+    console.error("Update failed:", e);
+  } finally {
+    updating = false;
+  }
 }
 
 // ================= RESET =================
 async function resetAllPartyRoles(guild) {
-  const members = await guild.members.fetch();
+  const members = await guild.members.fetch({ force: true });
 
   for (const [, member] of members) {
     const rolesToRemove = member.roles.cache.filter((r) => ALL_PARTY_ROLE_IDS.has(r.id));
@@ -192,8 +190,14 @@ client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   const guild = await client.guilds.fetch(GUILD_ID);
+
+  // Initial post/update
   await updateSelectionMessage(guild);
 
+  // Backup refresh every 30 seconds (always correct even if events fail)
+  setInterval(() => updateSelectionMessage(guild).catch(console.error), 30_000);
+
+  // Midnight reset
   cron.schedule(
     "0 0 * * *",
     async () => {
@@ -239,18 +243,7 @@ client.on("messageDeleteBulk", async (messages) => {
   }
 });
 
-// Update list when roles change (Leader removes role etc.)
-client.on("guildMemberUpdate", async (oldMember, newMember) => {
-  try {
-    const oldRole = oldMember.roles.cache.find((r) => ALL_PARTY_ROLE_IDS.has(r.id))?.id;
-    const newRole = newMember.roles.cache.find((r) => ALL_PARTY_ROLE_IDS.has(r.id))?.id;
-    if (oldRole !== newRole) scheduleStatusUpdate(newMember.guild);
-  } catch {
-    // ignore
-  }
-});
-
-// Button handler with 6/6 limit
+// ================= BUTTON HANDLER (LIVE UPDATE) =================
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
   if (!interaction.customId.startsWith("party_")) return;
@@ -271,7 +264,8 @@ client.on("interactionCreate", async (interaction) => {
   const partyNumber = Number(interaction.customId.split("_")[1]);
   const roleId = PARTY_ROLE_IDS[partyNumber];
 
-  await guild.members.fetch();
+  // Accurate count before adding
+  await guild.members.fetch({ force: true });
   const role = await guild.roles.fetch(roleId);
   const currentCount = role?.members ? role.members.size : 0;
 
@@ -292,7 +286,8 @@ client.on("interactionCreate", async (interaction) => {
     ephemeral: true,
   });
 
-  scheduleStatusUpdate(guild);
+  // LIVE UPDATE immediately after join
+  await updateSelectionMessage(guild);
 });
 
 // ================= ERROR HANDLING (NO CRASH) =================
@@ -301,4 +296,3 @@ process.on("unhandledRejection", (reason) => console.error("Unhandled Rejection:
 process.on("uncaughtException", (err) => console.error("Uncaught Exception:", err));
 
 client.login(process.env.DISCORD_TOKEN);
-
